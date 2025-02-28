@@ -1,29 +1,30 @@
 // Copyright (C) 2020-2022 Intel Corporation
-// Copyright (C) 2022 CVAT.ai Corporation
+// Copyright (C) CVAT.ai Corporation
 //
 // SPDX-License-Identifier: MIT
 
 import './styles.scss';
 import React, { useCallback } from 'react';
-import Menu from 'antd/lib/menu';
 import Modal from 'antd/lib/modal';
 import { LoadingOutlined } from '@ant-design/icons';
-// eslint-disable-next-line import/no-extraneous-dependencies
-import { MenuInfo } from 'rc-menu/lib/interface';
-import { DimensionType } from 'cvat-core-wrapper';
+import { DimensionType, CVATCore } from 'cvat-core-wrapper';
+import Menu, { MenuInfo } from 'components/dropdown-menu';
 import { usePlugins } from 'utils/hooks';
 import { CombinedState } from 'reducers';
+import { useSelector } from 'react-redux';
+
+type AnnotationFormats = Awaited<ReturnType<CVATCore['server']['formats']>>;
 
 interface Props {
     taskID: number;
     projectID: number | null;
     taskMode: string;
     bugTracker: string;
-    loaders: any[];
-    dumpers: any[];
+    loaders: AnnotationFormats['loaders'];
+    dumpers: AnnotationFormats['dumpers'];
     inferenceIsActive: boolean;
     taskDimension: DimensionType;
-    backupIsActive: boolean;
+    consensusEnabled: boolean;
     onClickMenu: (params: MenuInfo) => void;
 }
 
@@ -36,6 +37,9 @@ export enum Actions {
     OPEN_BUG_TRACKER = 'open_bug_tracker',
     BACKUP_TASK = 'backup_task',
     VIEW_ANALYTICS = 'view_analytics',
+    QUALITY_CONTROL = 'quality_control',
+    CONSENSUS_MANAGEMENT = 'consensus_management',
+    MERGE_CONSENSUS_JOBS = 'merge_consensus_jobs',
 }
 
 function ActionsMenuComponent(props: Props): JSX.Element {
@@ -44,11 +48,14 @@ function ActionsMenuComponent(props: Props): JSX.Element {
         projectID,
         bugTracker,
         inferenceIsActive,
-        backupIsActive,
+        consensusEnabled,
         onClickMenu,
     } = props;
 
     const plugins = usePlugins((state: CombinedState) => state.plugins.components.taskActions.items, props);
+
+    const mergingConsensus = useSelector((state: CombinedState) => state.consensus.actions.merging);
+    const isTaskInMergingConsensus = mergingConsensus[`task_${taskID}`];
 
     const onClickMenuWrapper = useCallback(
         (params: MenuInfo) => {
@@ -69,6 +76,20 @@ function ActionsMenuComponent(props: Props): JSX.Element {
                         danger: true,
                     },
                     okText: 'Delete',
+                });
+            } else if (params.key === Actions.MERGE_CONSENSUS_JOBS) {
+                Modal.confirm({
+                    title: 'The consensus jobs will be merged',
+                    content: 'Existing annotations in parent jobs will be updated. Continue?',
+                    className: 'cvat-modal-confirm-consensus-merge-task',
+                    onOk: () => {
+                        onClickMenu(params);
+                    },
+                    okButtonProps: {
+                        type: 'primary',
+                        danger: true,
+                    },
+                    okText: 'Merge',
                 });
             } else {
                 onClickMenu(params);
@@ -101,8 +122,6 @@ function ActionsMenuComponent(props: Props): JSX.Element {
     menuItems.push([(
         <Menu.Item
             key={Actions.BACKUP_TASK}
-            disabled={backupIsActive}
-            icon={backupIsActive && <LoadingOutlined id='cvat-backup-task-loading' />}
         >
             Backup Task
         </Menu.Item>
@@ -116,10 +135,37 @@ function ActionsMenuComponent(props: Props): JSX.Element {
         </Menu.Item>
     ), 50]);
 
+    menuItems.push([(
+        <Menu.Item
+            key={Actions.QUALITY_CONTROL}
+        >
+            Quality control
+        </Menu.Item>
+    ), 60]);
+
+    if (consensusEnabled) {
+        menuItems.push([(
+            <Menu.Item
+                key={Actions.CONSENSUS_MANAGEMENT}
+            >
+                Consensus management
+            </Menu.Item>
+        ), 55]);
+        menuItems.push([(
+            <Menu.Item
+                key={Actions.MERGE_CONSENSUS_JOBS}
+                disabled={isTaskInMergingConsensus}
+                icon={isTaskInMergingConsensus && <LoadingOutlined />}
+            >
+                Merge consensus jobs
+            </Menu.Item>
+        ), 60]);
+    }
+
     if (projectID === null) {
         menuItems.push([(
             <Menu.Item key={Actions.MOVE_TASK_TO_PROJECT}>Move to project</Menu.Item>
-        ), 60]);
+        ), 70]);
     }
 
     menuItems.push([(
@@ -137,7 +183,11 @@ function ActionsMenuComponent(props: Props): JSX.Element {
     );
 
     return (
-        <Menu selectable={false} className='cvat-actions-menu' onClick={onClickMenuWrapper}>
+        <Menu
+            selectable={false}
+            className='cvat-actions-menu'
+            onClick={onClickMenuWrapper}
+        >
             { menuItems.sort((menuItem1, menuItem2) => menuItem1[1] - menuItem2[1])
                 .map((menuItem) => menuItem[0]) }
         </Menu>
