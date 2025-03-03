@@ -1,5 +1,5 @@
 // Copyright (C) 2021-2022 Intel Corporation
-// Copyright (C) 2022 CVAT.ai Corporation
+// Copyright (C) CVAT.ai Corporation
 //
 // SPDX-License-Identifier: MIT
 
@@ -17,16 +17,19 @@ import {
 } from 'actions/tasks-actions';
 import { exportActions } from 'actions/export-actions';
 import { importActions } from 'actions/import-actions';
+import { mergeConsensusJobsAsync } from 'actions/consensus-actions';
+import { RQStatus, Task } from 'cvat-core-wrapper';
 
 interface OwnProps {
     taskInstance: any;
     onViewAnalytics: () => void;
+    onViewQualityControl: () => void;
+    onViewConsensusManagement: () => void;
 }
 
 interface StateToProps {
     annotationFormats: any;
     inferenceIsActive: boolean;
-    backupIsActive: boolean;
 }
 
 interface DispatchToProps {
@@ -35,6 +38,7 @@ interface DispatchToProps {
     openRunModelWindow: (taskInstance: any) => void;
     deleteTask: (taskInstance: any) => void;
     openMoveTaskToProjectWindow: (taskInstance: any) => void;
+    mergeConsensusJobs: (taskInstance: any) => void;
 }
 
 function mapStateToProps(state: CombinedState, own: OwnProps): StateToProps {
@@ -46,10 +50,12 @@ function mapStateToProps(state: CombinedState, own: OwnProps): StateToProps {
         formats: { annotationFormats },
     } = state;
 
+    const inference = state.models.inferences[tid];
+
     return {
         annotationFormats,
-        inferenceIsActive: tid in state.models.inferences,
-        backupIsActive: state.export.tasks.backup.current[tid],
+        inferenceIsActive: inference &&
+            ![RQStatus.FAILED, RQStatus.FINISHED].includes(inference.status),
     };
 }
 
@@ -74,6 +80,9 @@ function mapDispatchToProps(dispatch: any): DispatchToProps {
         openMoveTaskToProjectWindow: (taskId: number): void => {
             dispatch(switchMoveTaskModalVisible(true, taskId));
         },
+        mergeConsensusJobs: (taskInstance: Task): void => {
+            dispatch(mergeConsensusJobsAsync(taskInstance));
+        },
     };
 }
 
@@ -82,13 +91,15 @@ function ActionsMenuContainer(props: OwnProps & StateToProps & DispatchToProps):
         taskInstance,
         annotationFormats: { loaders, dumpers },
         inferenceIsActive,
-        backupIsActive,
         showExportModal,
         showImportModal,
         deleteTask,
         openRunModelWindow,
         openMoveTaskToProjectWindow,
         onViewAnalytics,
+        onViewQualityControl,
+        onViewConsensusManagement,
+        mergeConsensusJobs,
     } = props;
     const onClickMenu = (params: MenuInfo): void | JSX.Element => {
         const [action] = params.keyPath;
@@ -108,6 +119,12 @@ function ActionsMenuContainer(props: OwnProps & StateToProps & DispatchToProps):
             showImportModal(taskInstance);
         } else if (action === Actions.VIEW_ANALYTICS) {
             onViewAnalytics();
+        } else if (action === Actions.QUALITY_CONTROL) {
+            onViewQualityControl();
+        } else if (action === Actions.CONSENSUS_MANAGEMENT) {
+            onViewConsensusManagement();
+        } else if (action === Actions.MERGE_CONSENSUS_JOBS) {
+            mergeConsensusJobs(taskInstance);
         }
     };
 
@@ -122,7 +139,7 @@ function ActionsMenuContainer(props: OwnProps & StateToProps & DispatchToProps):
             inferenceIsActive={inferenceIsActive}
             onClickMenu={onClickMenu}
             taskDimension={taskInstance.dimension}
-            backupIsActive={backupIsActive}
+            consensusEnabled={taskInstance.consensusEnabled}
         />
     );
 }

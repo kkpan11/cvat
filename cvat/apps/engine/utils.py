@@ -1,38 +1,42 @@
 # Copyright (C) 2020-2022 Intel Corporation
+# Copyright (C) CVAT.ai Corporation
 #
 # SPDX-License-Identifier: MIT
 
 import ast
-import cv2 as cv
-from collections import namedtuple
 import hashlib
 import importlib
+import logging
+import os
+import platform
+import re
+import subprocess
 import sys
 import traceback
-from contextlib import suppress
-from typing import Any, Dict, Optional, Callable, Union
-import subprocess
-import os
 import urllib.parse
-import re
-import logging
-import platform
-
-from rq.job import Job
-from django_rq.queues import DjangoRQ
-from pathlib import Path
-
-from django.http.request import HttpRequest
-from django.utils import timezone
-from django.utils.http import urlencode
-from rest_framework.reverse import reverse as _reverse
-
-from av import VideoFrame
-from PIL import Image
+from collections import namedtuple
+from collections.abc import Generator, Iterable, Mapping, Sequence
+from contextlib import nullcontext, suppress
+from itertools import islice
 from multiprocessing import cpu_count
+from pathlib import Path
+from typing import Any, Callable, Optional, TypeVar, Union
 
+import cv2 as cv
+from attr.converters import to_bool
+from av import VideoFrame
+from datumaro.util.os_util import walk
+from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.utils.http import urlencode
+from django_rq.queues import DjangoRQ
 from django_sendfile import sendfile as _sendfile
+from PIL import Image
+from redis.lock import Lock
+from rest_framework.reverse import reverse as _reverse
+from rq.job import Job as RQJob
+
+from cvat.apps.engine.types import ExtendedRequest
 
 Import = namedtuple("Import", ["module", "name", "alias"])
 
@@ -90,6 +94,9 @@ def execute_python_code(source_code, global_vars=None, local_vars=None):
         line_number = traceback.extract_tb(tb)[-1][1]
         raise InterpreterError("{} at line {}: {}".format(error_class, line_number, details))
 
+class CvatChunkTimestampMismatchError(Exception):
+    pass
+
 def av_scan_paths(*paths):
     if 'yes' == os.environ.get('CLAM_AV'):
         command = ['clamscan', '--no-summary', '-i', '-o']
@@ -126,7 +133,7 @@ def parse_specific_attributes(specific_attributes):
     } if parsed_specific_attributes else dict()
 
 
-def parse_exception_message(msg):
+def parse_exception_message(msg: str) -> str:
     parsed_msg = msg
     try:
         if 'ErrorDetail' in msg:
@@ -139,10 +146,8 @@ def parse_exception_message(msg):
         pass
     return parsed_msg
 
-def process_failed_job(rq_job: Job):
-    exc_info = str(rq_job.exc_info or getattr(rq_job.dependency, 'exc_info', None) or '')
-    if rq_job.dependency:
-        rq_job.dependency.delete()
+def process_failed_job(rq_job: RQJob) -> str:
+    exc_info = str(rq_job.exc_info or '')
     rq_job.delete()
 
     msg = parse_exception_message(exc_info)
@@ -151,62 +156,29 @@ def process_failed_job(rq_job: Job):
     return msg
 
 
-def configure_dependent_job(
-    queue: DjangoRQ,
-    rq_id: str,
-    rq_func: Callable[[Any, str, str], None],
-    db_storage: Any,
-    filename: str,
-    key: str,
-    request: HttpRequest,
-    result_ttl: float,
-    failure_ttl: float
-) -> Job:
-    rq_job_id_download_file = rq_id + f'?action=download_{filename}'
-    rq_job_download_file = queue.fetch_job(rq_job_id_download_file)
-    if not rq_job_download_file:
-        # note: boto3 resource isn't pickleable, so we can't use storage
-        rq_job_download_file = queue.enqueue_call(
-            func=rq_func,
-            args=(db_storage, filename, key),
-            job_id=rq_job_id_download_file,
-            meta=get_rq_job_meta(request=request, db_obj=db_storage),
-            result_ttl=result_ttl,
-            failure_ttl=failure_ttl
+def get_rq_lock_by_user(queue: DjangoRQ, user_id: int, *, timeout: Optional[int] = 30, blocking_timeout: Optional[int] = None) -> Union[Lock, nullcontext]:
+    if settings.ONE_RUNNING_JOB_IN_QUEUE_PER_USER:
+        return queue.connection.lock(
+            name=f'{queue.name}-lock-{user_id}',
+            timeout=timeout,
+            blocking_timeout=blocking_timeout,
         )
-    return rq_job_download_file
+    return nullcontext()
 
-def get_rq_job_meta(request, db_obj):
-    # to prevent circular import
-    from cvat.apps.webhooks.signals import project_id, organization_id
-    from cvat.apps.events.handlers import task_id, job_id, organization_slug
+def get_rq_lock_for_job(queue: DjangoRQ, rq_id: str, *, timeout: int = 60, blocking_timeout: int = 50) -> Lock:
+    # lock timeout corresponds to the nginx request timeout (proxy_read_timeout)
 
-    oid = organization_id(db_obj)
-    oslug = organization_slug(db_obj)
-    pid = project_id(db_obj)
-    tid = task_id(db_obj)
-    jid = job_id(db_obj)
-
-    return {
-        'user': {
-            'id': getattr(request.user, "id", None),
-            'username': getattr(request.user, "username", None),
-            'email': getattr(request.user, "email", None),
-        },
-        'request': {
-            "uuid": request.uuid,
-            "timestamp": timezone.localtime(),
-        },
-        'org_id': oid,
-        'org_slug': oslug,
-        'project_id': pid,
-        'task_id': tid,
-        'job_id': jid,
-    }
+    assert timeout is not None
+    assert blocking_timeout is not None
+    return queue.connection.lock(
+        name=f'lock-for-job-{rq_id}'.lower(),
+        timeout=timeout,
+        blocking_timeout=blocking_timeout,
+    )
 
 def reverse(viewname, *, args=None, kwargs=None,
-    query_params: Optional[Dict[str, str]] = None,
-    request: Optional[HttpRequest] = None,
+    query_params: Optional[dict[str, str]] = None,
+    request: ExtendedRequest | None = None,
 ) -> str:
     """
     The same as rest_framework's reverse(), but adds custom query params support.
@@ -221,10 +193,10 @@ def reverse(viewname, *, args=None, kwargs=None,
 
     return url
 
-def get_server_url(request: HttpRequest) -> str:
+def get_server_url(request: ExtendedRequest) -> str:
     return request.build_absolute_uri('/')
 
-def build_field_filter_params(field: str, value: Any) -> Dict[str, str]:
+def build_field_filter_params(field: str, value: Any) -> dict[str, str]:
     """
     Builds a collection filter query params for a single field and value.
     """
@@ -240,15 +212,6 @@ def get_list_view_name(model):
     return '%(model_name)s-list' % {
         'model_name': model._meta.object_name.lower()
     }
-
-def get_import_rq_id(
-    resource_type: str,
-    resource_id: int,
-    subresource_type: str,
-    user: str,
-) -> str:
-    # import:<task|project|job>-<id|uuid>-<annotations|dataset|backup>-by-<user>
-    return f"import:{resource_type}-{resource_id}-{subresource_type}-by-{user}"
 
 def import_resource_with_clean_up_after(
     func: Union[Callable[[str, int, int], int], Callable[[str, int, str, bool], None]],
@@ -301,7 +264,7 @@ def make_attachment_file_name(filename: str) -> str:
     return filename
 
 def sendfile(
-    request, filename,
+    request: ExtendedRequest, filename,
     attachment=False, attachment_filename=None, mimetype=None, encoding=None
 ):
     """
@@ -329,3 +292,114 @@ def sendfile(
         attachment_filename = make_attachment_file_name(attachment_filename)
 
     return _sendfile(request, filename, attachment, attachment_filename, mimetype, encoding)
+
+
+def build_backup_file_name(
+    *,
+    class_name: str,
+    identifier: str | int,
+    timestamp: str,
+    extension: str = "{}",
+) -> str:
+    # "<project|task>_<name>_backup_<timestamp>.zip"
+    return "{}_{}_backup_{}{}".format(
+        class_name, identifier, timestamp, extension,
+    ).lower()
+
+def build_annotations_file_name(
+    *,
+    class_name: str,
+    identifier: str | int,
+    timestamp: str,
+    format_name: str,
+    is_annotation_file: bool = True,
+    extension: str = "{}",
+) -> str:
+    # "<project|task|job>_<name|id>_<annotations|dataset>_<timestamp>_<format>.zip"
+    return "{}_{}_{}_{}_{}{}".format(
+        class_name, identifier, 'annotations' if is_annotation_file else 'dataset',
+        timestamp, format_name, extension,
+    ).lower()
+
+
+def directory_tree(path, max_depth=None) -> str:
+    if not os.path.exists(path):
+        raise Exception(f"No such file or directory: {path}")
+
+    tree = ""
+
+    baselevel = path.count(os.sep)
+    for root, _, files in walk(path, max_depth=max_depth):
+        curlevel = root.count(os.sep)
+        indent = "|  " * (curlevel - baselevel) + "|-"
+        tree += f"{indent}{os.path.basename(root)}/\n"
+        for file in files:
+            tree += f"{indent}-{file}\n"
+    return tree
+
+def is_dataset_export(request: ExtendedRequest) -> bool:
+    return to_bool(request.query_params.get('save_images', False))
+
+_T = TypeVar('_T')
+
+def take_by(iterable: Iterable[_T], chunk_size: int) -> Generator[list[_T], None, None]:
+    """
+    Returns elements from the input iterable by batches of N items.
+    ('abcdefg', 3) -> ['a', 'b', 'c'], ['d', 'e', 'f'], ['g']
+    """
+    # can be changed to itertools.batched after migration to python3.12
+
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, chunk_size))
+        if len(batch) == 0:
+            break
+
+        yield batch
+
+
+FORMATTED_LIST_DISPLAY_THRESHOLD = 10
+"""
+Controls maximum rendered list items. The remainder is appended as ' (and X more)'.
+"""
+
+def format_list(
+    items: Sequence[str], *, max_items: Optional[int] = None, separator: str = ", "
+) -> str:
+    if max_items is None:
+        max_items = FORMATTED_LIST_DISPLAY_THRESHOLD
+
+    remainder_count = len(items) - max_items
+    return "{}{}".format(
+        separator.join(items[:max_items]),
+        f" (and {remainder_count} more)" if 0 < remainder_count else "",
+    )
+
+
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+
+
+def grouped(items: Iterable[_V], *, key: Callable[[_V], _K]) -> Mapping[_K, Sequence[_V]]:
+    """
+    Returns a mapping with input iterable elements grouped by key, for example:
+
+    grouped(
+        [("apple1", "red"), ("apple2", "green"), ("apple3", "red")],
+        key=lambda v: v[1]
+    )
+    ->
+    {
+        "red": [("apple1", "red"), ("apple3", "red")],
+        "green": [("apple2", "green")]
+    }
+
+    Similar to itertools.groupby, but allows reiteration on resulting groups.
+    """
+
+    # Can be implemented with itertools.groupby, but it requires extra sorting for input elements
+    grouped_items = {}
+    for item in items:
+        grouped_items.setdefault(key(item), []).append(item)
+
+    return grouped_items
